@@ -1,0 +1,15 @@
+import test from 'node:test';import assert from 'node:assert/strict';import { createECDH,randomBytes } from 'node:crypto';import webpush from 'web-push';
+import { createDispatchHandler } from '../netlify/functions/dispatch';import { emptyRegistry,admit,type Registry } from '../netlify/lib/push-domain';
+import type { updateRegistry } from '../netlify/lib/push-store';
+test('dispatch auth/body guards, concurrent lease, per-version dedup and expired endpoint cleanup',async()=>{
+ const origin='https://example.org';const vapid=webpush.generateVAPIDKeys();const secret=randomBytes(32).toString('base64url');process.env.SITE_ORIGIN=origin;process.env.VAPID_PUBLIC_KEY=vapid.publicKey;process.env.VAPID_PRIVATE_KEY=vapid.privateKey;process.env.PUSH_DISPATCH_SECRET=secret;
+ let registry=emptyRegistry();for(const suffix of ['one','two','expired']){const ec=createECDH('prime256v1');ec.generateKeys();registry=admit(registry,{subscription:{endpoint:`https://fcm.googleapis.com/fcm/send/${suffix}`,keys:{p256dh:ec.getPublicKey().toString('base64url'),auth:randomBytes(16).toString('base64url')}}},origin).registry;}
+ let writes=0;const update:typeof updateRegistry=async<T>(mutate:(r:Registry)=>{registry:Registry;result:T})=>{writes++;const next=mutate(structuredClone(registry));registry=next.registry;return next.result;};let sends=0;
+ const send:typeof fetch=async(input,init)=>{sends++;assert.equal(init?.redirect,'error');assert.equal(init?.method,'POST');assert(init?.signal);await new Promise(r=>setTimeout(r,15));return new Response('',{status:String(input).endsWith('/expired')?410:201});};
+ const handler=createDispatchHandler(update,send);const context={deploy:{context:'production',published:true,id:'fixture'}} as import('@netlify/functions').Context;const req=(body?:string)=>new Request(origin+'/api/push/dispatch',{method:'POST',headers:{Authorization:`Bearer ${secret}`},body});
+ try{assert.equal((await handler(new Request(origin+'/api/push/dispatch',{method:'POST'}),context)).status,401);assert.equal(writes,0);assert.equal((await handler(req('{"url":"https://evil.org"}'),context)).status,400);assert.equal(writes,0);
+ const concurrent=await Promise.all([handler(req(),context),handler(req(),context)]);assert.deepEqual(concurrent.map(r=>r.status).sort(),[200,409]);const receipt=await concurrent.find(r=>r.status===200)!.json();assert.equal(receipt.sent,2);assert.equal(receipt.expired,1);assert.equal(sends,3);assert.equal(registry.records.length,2);assert(registry.records.every(r=>r.lastSentVersion===receipt.version));assert.equal(registry.leaseId,null);
+ const again=await handler(req(),context);const duplicate=await again.json();assert.equal(duplicate.sent,0);assert.equal(sends,3);assert(!JSON.stringify(duplicate).includes('endpoint'));assert(!JSON.stringify(duplicate).includes(secret));
+ assert.equal((await handler(req(),{deploy:{context:'deploy-preview',published:false,id:'fixture'}} as import('@netlify/functions').Context)).status,503);
+ }finally{for(const key of ['SITE_ORIGIN','VAPID_PUBLIC_KEY','VAPID_PRIVATE_KEY','PUSH_DISPATCH_SECRET'])delete process.env[key];}
+});
